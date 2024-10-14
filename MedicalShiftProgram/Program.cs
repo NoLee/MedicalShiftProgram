@@ -1,241 +1,191 @@
 ﻿using ClosedXML.Excel;
+using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
-class ShiftScheduler2
+class ShiftScheduler
 {
-    static List<string> people = new List<string> { };
-
-    // Days off mapping for each person
-    static Dictionary<string, List<int>> daysOff = new Dictionary<string, List<int>>() {};
-
-    // Define weekends (Saturday and Sunday) for this example
-    static List<int> weekends = new List<int> { };
-
-    // Track weekend shifts per person
-    static Dictionary<string, int> weekendCount = people.ToDictionary(person => person, person => 0);
-
-    // Specify the number of workers needed per day (e.g., most days need 2, some need 3)
-    static List<int> workersPerDay = new List<int> { };
-
-    static int daysInMonth = 0;
-
-    static int countTotalTest = 0;
-
-    // Initialize schedule dictionary (1-30 days)
-    static Dictionary<int, List<string>> schedule = new Dictionary<int, List<string>>();
+    // Define constants
+    static int SHIFTS_PER_DAY = 3;
+    static int _weekendDays; // Let's assume Saturday and Sunday are the last two days
+    static int _numPeople;
+    static int _numDays;
+    static int _totalShifts;
+    static List<int> _weekendDaysIndices = new List<int> { };
+    static List<string> _people = new List<string> { };
+    static Dictionary<int, List<int>> _unavailableDays = new Dictionary<int, List<int>> { };
 
     static void Main()
     {
         Initialize();
+        // Create a CP-SAT model
+        CpModel model = new CpModel();
 
-        for (int day = 1; day <= 30; day++)
+        // Decision variables: shift[i][j] = 1 if person i works on day j, otherwise 0
+        BoolVar[,] shifts = new BoolVar[_numPeople, _numDays];
+        for (int i = 0; i < _numPeople; i++)
         {
-            schedule[day] = new List<string>();
+            for (int j = 0; j < _numDays; j++)
+            {
+                shifts[i, j] = model.NewBoolVar($"shift_{i}_{j}");
+            }
         }
-        int minCount = 0;
-        int maxCount = 100;
-        int minCountTotal = 0;
-        int maxCountTotal = 100;
-        var daysTotalForPerson = new Dictionary<string, int> { };
-        //Try to have 1 diff for weekends
-        while ((maxCount > minCount +2) || (maxCountTotal > minCountTotal + 2))
+
+        // Constraint 1: Each day must have exactly 3 people working
+        for (int j = 0; j < _numDays; j++)
         {
-            schedule.Clear();
-            daysTotalForPerson.Clear();
-            foreach (string person in people)
+            var dailyWorkers = new List<ILiteral>();
+            for (int i = 0; i < _numPeople; i++)
             {
-                daysTotalForPerson.Add(person, 0);
+                dailyWorkers.Add(shifts[i, j]);
             }
-            weekendCount = people.ToDictionary(person => person, person => 0);
-            var isValid = AssignShifts(1);
-            if (isValid == false)
+            model.Add(LinearExpr.Sum(dailyWorkers) == SHIFTS_PER_DAY);
+        }
+
+        // Constraint 2: No one should work two consecutive days
+        for (int i = 0; i < _numPeople; i++)
+        {
+            for (int j = 0; j < _numDays - 1; j++)
             {
-                Console.WriteLine("No valid schedule could be found.");
-                return;
+                model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 1].Not() });
             }
-            for (int day = 1; day <= 30; day++)
+        }
+
+        // Constraint 3: Respect each person's unavailable days
+        foreach (var person in _unavailableDays.Keys)
+        {
+            foreach (var day in _unavailableDays[person])
             {
-                foreach(string person in schedule[day])
+                model.Add(shifts[person, day] == 0); // Ensure person is not scheduled on unavailable days
+            }
+        }
+
+        // Constraint 4: Balance weekends equally among people
+
+        var weekendWorkload = new List<ILiteral>[_numPeople];
+        for (int i = 0; i < _numPeople; i++)
+        {
+            weekendWorkload[i] = new List<ILiteral>();
+            foreach (var day in _weekendDaysIndices)
+            {
+                weekendWorkload[i].Add(shifts[i, day]);
+            }
+        }
+        int minWeekendShifts = (_weekendDays * SHIFTS_PER_DAY) / _numPeople;
+        int maxWeekendShifts = minWeekendShifts + 1;
+
+        for (int i = 0; i < _numPeople; i++)
+        {
+            model.AddLinearConstraint(LinearExpr.Sum(weekendWorkload[i]), minWeekendShifts, maxWeekendShifts);
+        }
+
+        //// New Constraint 5: Everyone works approximately the same number of days
+        //// Calculate the minimum and maximum shifts each person can work
+        int minShifts = _totalShifts / _numPeople;       // Minimum shifts a person should work
+        int maxShifts = (_totalShifts + _numPeople - 1) / _numPeople; // Maximum shifts (ceil)
+        var workload = new List<ILiteral>[_numPeople];
+        for (int i = 0; i < _numPeople; i++)
+        {
+            workload[i] = new List<ILiteral>();
+            for (int j = 0; j < _numDays - 1; j++)
+            {
+                workload[i].Add(shifts[i, j]);
+            }
+        }
+
+        for (int i = 0; i < _numPeople; i++)
+        {
+            model.AddLinearConstraint(LinearExpr.Sum(workload[i]), minShifts, maxShifts);
+        }
+
+        // Solve the model
+        CpSolver solver = new CpSolver();
+        var status = solver.Solve(model);
+        var weekendCount = new List<int>();
+        var totalCount = new List<int>();
+        for (var i = 0; i <= _people.Count(); i++)
+        {
+            weekendCount.Add(0);
+            totalCount.Add(0);
+        }
+        // Check results
+        if (status == CpSolverStatus.Feasible || status == CpSolverStatus.Optimal)
+        {
+            for (int j = 0; j < _numDays; j++)
+            {
+                var x = _weekendDaysIndices.Contains(j) ? "(weekend)" : "";
+                Console.Write($"Nov {j + 1}{x}: ");
+                for (int i = 0; i < _numPeople; i++)
                 {
-                    daysTotalForPerson[person]++;
+                    if (solver.BooleanValue(shifts[i, j]))
+                    {
+                        if (_weekendDaysIndices.Contains(j))
+                        {
+                            weekendCount[i]++;
+                        }
+                        totalCount[i]++;
+                        Console.Write($"{_people[i]} ");
+                    }
                 }
+                Console.WriteLine();
             }
-            minCount = weekendCount.Values.Min();
-            maxCount = weekendCount.Values.Max();
-
-            minCountTotal = daysTotalForPerson.Values.Min();
-            maxCountTotal = daysTotalForPerson.Values.Max();
-        }
-
-        // Start the shift assignment using backtracking
-        //if (AssignShifts(1))
-        //{
-            // Print the successful schedule
-       
-
-        for (int day = 1; day <= 30; day++)
-        {
-            Console.WriteLine($"Day {day}: {string.Join(", ", schedule[day])}");
-        }
-
-        Console.WriteLine("");
-        foreach (string person in people)
-        {
-            Console.WriteLine("Total days for " + person + ": " + daysTotalForPerson[person]);
-        }
-        Console.WriteLine("");
-        foreach (string person in people)
-        {
-            Console.WriteLine("Weekend days for " + person + ": " + weekendCount[person]);
-        }
-
-        Console.WriteLine("Total tries " + countTotalTest);
-    }
-
-    // Method to check if a person can work on a given day
-    static bool CanWork(string person, int day)
-    {
-        // Check if the person has the day off
-        if (daysOff.ContainsKey(person) && daysOff[person].Contains(day))
-            return false;
-
-        // Check if they worked the previous day
-        if (day > 1 && schedule[day - 1].Contains(person))
-            return false;
-
-        // Check if they worked the other previous day
-        //only sometimes
-/*        Random random = new Random();
-        int randomNumber = random.Next(3);
-        if (randomNumber == 1 && day > 2 && schedule[day - 2].Contains(person))
-            return false;*/
-
-        return true;
-    }
-
-    // Backtracking function to assign shifts
-    static bool AssignShifts(int day)
-    {
-        // If we have reached past the last day, return true (successful assignment)
-        if (day > 30)
-        {
-            return true;
-        }
-
-        // Try assigning the required number of people for the current day
-        //people.Where(x => CanWork(x, day))
-        var candidates = people.OrderBy(x => Guid.NewGuid()).ToList(); // Randomize to add variation
-
-        return TryAssignPeople(day, 0, new List<string>(), candidates);
-    }
-
-    // Helper function to recursively assign required workers for the day
-    static bool TryAssignPeople(int day, int assignedCount, List<string> assignedPeople, List<string> candidates)
-    {
-        // Base case: if we have assigned the required number of people for the day
-        if (assignedCount == workersPerDay[day - 1])
-        {
-            schedule[day] = new List<string>(assignedPeople);
-
-            // Adjust weekend counts
-            foreach (var person in assignedPeople)
+            Console.WriteLine();
+            for (var i=0; i<_people.Count();i++)
             {
-                if (weekends.Contains(day))
-                {
-                    weekendCount[person]++;
-                }
+                Console.WriteLine($"Weekend count for {_people[i]}: {weekendCount[i]}");
             }
-
-            // Recur for the next day
-            if (AssignShifts(day + 1))
+            Console.WriteLine();
+            for (var i = 0; i < _people.Count(); i++)
             {
-                return true; // Successful assignment
+                Console.WriteLine($"Total count for {_people[i]}: {totalCount[i]}");
             }
-
-            // Backtrack: Remove the assignments
-            foreach (var person in assignedPeople)
-            {
-                if (weekends.Contains(day))
-                {
-                    weekendCount[person]--;
-                }
-            }
-
-            return false; // Backtracking
         }
-
-        // Try to assign more people from the candidate list
-        foreach (var person in candidates)
+        else
         {
-            if (!CanWork(person, day) || assignedPeople.Contains(person))
-                continue;
-
-            // Check for weekend balancing
-/*            if (weekends.Contains(day) )
-            {
-                int minCount = weekendCount.Values.Min() + 1;
-                if (weekendCount[person] > minCount)
-                {
-                    continue;
-                }
-            }*/
-
-            // Add the person to the assigned list and recurse
-            assignedPeople.Add(person);
-            countTotalTest++;
-            if (TryAssignPeople(day, assignedCount + 1, assignedPeople, candidates))
-            {
-                return true;
-            }
-
-            // Backtrack: Remove the person if it didn't work out
-            assignedPeople.Remove(person);
+            Console.WriteLine("No feasible solution found.");
         }
-
-        // No valid assignment found for this day, backtrack
-        return false;
     }
 
     static void Initialize()
     {
         // Open the Excel workbook
-        using (var workbook = new XLWorkbook("C:/Users/NoLee/Desktop/nosokomeio.xlsx"))
+        using (var workbook = new XLWorkbook("C:\\Users\\NoLee\\source\\repos\\MedicalShiftProgram\\nosokomeio.xlsx"))
         {
             // Access a specific worksheet by name
             var programWorksheet = workbook.Worksheet("program");
             var negativesWorksheet = workbook.Worksheet("negatives");
 
-            daysInMonth = programWorksheet.Cell(1,1).GetValue<int>();
-            var rowsCount = daysInMonth + 1;
-            var columnCountNegatives = negativesWorksheet.ColumnsUsed().Count();
-
+            _numDays = programWorksheet.Cell(1, 1).GetValue<int>();
+            _totalShifts = _numDays * SHIFTS_PER_DAY;
+            _numPeople = negativesWorksheet.ColumnsUsed().Count()-1;
+            var rowsCount = _numDays + 1;
             //Setup weekends list
-            for (int row=2; row<= rowsCount; row++)
+            for (int row = 2; row <= rowsCount; row++)
             {
-                var dayNumber = row - 1;
+                var dayNumber = row - 2;
                 var isWeekend = programWorksheet.Cell(row, 3).GetValue<int>();
                 if (isWeekend == 1)
                 {
-                    weekends.Add(dayNumber);
+                    _weekendDaysIndices.Add(dayNumber);
                 }
             }
+            _weekendDays = _weekendDaysIndices.Count();
 
             //Setup workersPerDay array
-            for (int row = 2; row <= rowsCount; row++)
-            {
-                workersPerDay.Add(programWorksheet.Cell(row, 2).GetValue<int>());
-            }
+            //for (int row = 2; row <= rowsCount; row++)
+            //{
+            //    workersPerDay.Add(programWorksheet.Cell(row, 2).GetValue<int>());
+            //}
 
             //Setup people
-            for (int col = 2; col <= columnCountNegatives; col++)
+            for (int col = 2; col <= _numPeople+1; col++)
             {
-                people.Add(negativesWorksheet.Cell(1, col).GetValue<string>());
+                _people.Add(negativesWorksheet.Cell(1, col).GetValue<string>());
             }
 
             //Setup negatives for each person
-            for (int col = 2; col <= columnCountNegatives; col++)
+            for (int col = 2; col <= _numPeople+1; col++)
             {
                 var negativeDaysList = new List<int> { };
                 for (int row = 2; row <= rowsCount; row++)
@@ -243,13 +193,31 @@ class ShiftScheduler2
                     var value = negativesWorksheet.Cell(row, col).GetValue<int>();
                     if (value == 1)
                     {
-                        negativeDaysList.Add(row - 1);
+                        negativeDaysList.Add(row - 2);
                     }
                 }
-                daysOff.Add(people[col-2], negativeDaysList);
+                _unavailableDays.Add(col - 2, negativeDaysList);
             }
 
-            weekendCount = people.ToDictionary(person => person, person => 0);
+            //weekendCount = people.ToDictionary(person => person, person => 0);
         }
     }
+
+    //var unavailableDays = new Dictionary<int, List<int>>
+    //{
+    //    { 0, new List<int> {  } },  // ΧΡΙΣΤΟΔΟΥΛΟΥ
+    //    { 1, new List<int> {  } },  // ΦΙΛΙΠΠΟΥΣΗ
+    //    { 2, new List<int> { } },  // ΜΠΙΝΙΣΚΟΥ
+    //    { 3, new List<int> { 2 } },  // ΜΠΟΤΟΥ
+    //    { 4, new List<int> {  } },  // ΣΟΥΛΙΜΑ
+    //    { 5, new List<int> {  } },  // ΜΠΑΚΟΠΟΥΛΟΣ
+    //    { 6, new List<int> { } },  // ΚΑΡΑΜΟΛΕΓΚΟΥ
+    //    { 7, new List<int> { } },  // ΤΣΟΥΜΑ
+    //    { 8, new List<int> {  } },  // ΜΟΝΟΠΑΤΗΣ
+    //    { 9, new List<int> { } },  // ΠΡΟΔΡΟΜΑΚΗΣ
+    //    { 10, new List<int> {  } },  // ΑΥΓΕΡΙΝΟΥ
+    //    { 11, new List<int> { 22, 23 } },  // ΜΠΡΑΙΜΑΚΗΣ
+    //    { 12, new List<int> { } },  // ΠΑΠΑΚΩΝΣΤΑΝΤΙΝΟΥ
+    //    { 13, new List<int> {  } }  // ΠΑΝΑΓΟΥΛΑ
+    //};
 }

@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 
-class ShiftScheduler
+class ShiftScheduler2
 {
     static List<string> people = new List<string> { "Alice", "Bob", "Charlie", "David", "Eva", "Frank", "Grace", "Helen" };
 
