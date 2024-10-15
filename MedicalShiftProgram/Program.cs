@@ -1,4 +1,5 @@
 ﻿using ClosedXML.Excel;
+using DocumentFormat.OpenXml.Spreadsheet;
 using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
@@ -7,19 +8,33 @@ using System.Linq;
 class ShiftScheduler
 {
     // Define constants
-    static int SHIFTS_PER_DAY = 3;
-    static int _weekendDays; // Let's assume Saturday and Sunday are the last two days
+    static List<int> SHIFTS_PER_DAY_LIST = new List<int> { };
+    static int _weekendDays;
     static int _numPeople;
     static int _numDays;
     static int _totalShifts;
+    static bool _allowB2BShifts;
+    static bool _balanceShiftsAutomatically;
+
     static List<int> _weekendDaysIndices = new List<int> { };
     static List<string> _people = new List<string> { };
+    static List<int> _juniorIndices = new List<int> { };
+    static List<int> _seniorIndices = new List<int> { };
+    static List<int> _desiredShiftCounts = new List<int> { };
     static Dictionary<int, List<int>> _unavailableDays = new Dictionary<int, List<int>> { };
 
     static void Main()
     {
-        Initialize();
-        // Create a CP-SAT model
+        try
+        {
+            Initialize();
+        }
+        catch (Exception e) 
+        {
+            Console.WriteLine($"ERROR: {e.Message.ToString()}");
+            return;
+        }
+
         CpModel model = new CpModel();
 
         // Decision variables: shift[i][j] = 1 if person i works on day j, otherwise 0
@@ -32,7 +47,7 @@ class ShiftScheduler
             }
         }
 
-        // Constraint 1: Each day must have exactly 3 people working
+        // Constraint 1: Each day must have exactly i people working
         for (int j = 0; j < _numDays; j++)
         {
             var dailyWorkers = new List<ILiteral>();
@@ -40,16 +55,23 @@ class ShiftScheduler
             {
                 dailyWorkers.Add(shifts[i, j]);
             }
-            model.Add(LinearExpr.Sum(dailyWorkers) == SHIFTS_PER_DAY);
+            model.Add(LinearExpr.Sum(dailyWorkers) == SHIFTS_PER_DAY_LIST[j]); // Adjust based on the number of shifts that day
         }
 
         // Constraint 2: No one should work two consecutive days
         for (int i = 0; i < _numPeople; i++)
         {
-            for (int j = 0; j < _numDays - 1; j++)
+            for (int j = 0; j < _numDays - 2; j++)
             {
+                // If person `i` works on day `j`, then they must not work on `j+1` or `j+2`
                 model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 1].Not() });
+                if (_allowB2BShifts == false)
+                {
+                    model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 2].Not() });
+                }
             }
+            //Edge case for last day
+            model.AddBoolOr(new ILiteral[] { shifts[i, _numDays -1].Not(), shifts[i, _numDays - 2].Not() });
         }
 
         // Constraint 3: Respect each person's unavailable days
@@ -62,7 +84,7 @@ class ShiftScheduler
         }
 
         // Constraint 4: Balance weekends equally among people
-
+        //TODO this should change accordingly
         var weekendWorkload = new List<ILiteral>[_numPeople];
         for (int i = 0; i < _numPeople; i++)
         {
@@ -72,7 +94,8 @@ class ShiftScheduler
                 weekendWorkload[i].Add(shifts[i, day]);
             }
         }
-        int minWeekendShifts = (_weekendDays * SHIFTS_PER_DAY) / _numPeople;
+        var weekendShifts = SHIFTS_PER_DAY_LIST.Where((_, i) => _weekendDaysIndices.Contains(i)).Sum();
+        int minWeekendShifts = weekendShifts / _numPeople;
         int maxWeekendShifts = minWeekendShifts + 1;
 
         for (int i = 0; i < _numPeople; i++)
@@ -80,23 +103,59 @@ class ShiftScheduler
             model.AddLinearConstraint(LinearExpr.Sum(weekendWorkload[i]), minWeekendShifts, maxWeekendShifts);
         }
 
-        //// New Constraint 5: Everyone works approximately the same number of days
-        //// Calculate the minimum and maximum shifts each person can work
-        int minShifts = _totalShifts / _numPeople;       // Minimum shifts a person should work
-        int maxShifts = (_totalShifts + _numPeople - 1) / _numPeople; // Maximum shifts (ceil)
-        var workload = new List<ILiteral>[_numPeople];
-        for (int i = 0; i < _numPeople; i++)
+        if (_balanceShiftsAutomatically)
         {
-            workload[i] = new List<ILiteral>();
-            for (int j = 0; j < _numDays - 1; j++)
+            // Constraint 5: Balance total shifts equally among people with ±1 difference
+            int totalMinShifts = _totalShifts / _numPeople;
+            int totalMaxShifts = totalMinShifts + 1;
+
+            for (int i = 0; i < _numPeople; i++)
             {
-                workload[i].Add(shifts[i, j]);
+                var totalShiftsPerPerson = new List<ILiteral>();
+                for (int j = 0; j < _numDays; j++)
+                {
+                    totalShiftsPerPerson.Add(shifts[i, j]);
+                }
+                model.AddLinearConstraint(LinearExpr.Sum(totalShiftsPerPerson), totalMinShifts, totalMaxShifts);
+            }
+        }
+        else
+        {
+            // Constraint 5: Ensure each person gets the specified number of shifts
+            for (int i = 0; i < _numPeople; i++)
+            {
+                // Create an expression that sums up all the shifts this person has
+                List<ILiteral> personShifts = new List<ILiteral>();
+                for (int j = 0; j < _numDays; j++)
+                {
+                    personShifts.Add(shifts[i, j]);
+                }
+
+                // Add a constraint to ensure the exact number of shifts for the person
+                model.Add(LinearExpr.Sum(personShifts) == _desiredShiftCounts[i]);
             }
         }
 
-        for (int i = 0; i < _numPeople; i++)
-        {
-            model.AddLinearConstraint(LinearExpr.Sum(workload[i]), minShifts, maxShifts);
+        // Constraint 6: JUNIOR members require at least one SENIOR member on the same shift
+        for(int j = 0; j < _numDays; j++)
+{
+            foreach (int junior in _juniorIndices)
+            {
+                // Collect all senior presence indicators for the given day
+                List<ILiteral> seniorPresence = new List<ILiteral>();
+                foreach (int senior in _seniorIndices)
+                {
+                    seniorPresence.Add(shifts[senior, j]);
+                }
+
+                // Create a condition that at least one SENIOR is present
+                var atLeastOneSenior = new List<ILiteral>();
+                atLeastOneSenior.AddRange(seniorPresence);
+                atLeastOneSenior.Add(shifts[junior, j].Not()); // If JUNIOR is working, then add OR condition for at least one SENIOR
+
+                // Ensure that if a JUNIOR is working, at least one SENIOR must be working
+                model.AddBoolOr(atLeastOneSenior);
+            }
         }
 
         // Solve the model
@@ -156,10 +215,26 @@ class ShiftScheduler
             var programWorksheet = workbook.Worksheet("program");
             var negativesWorksheet = workbook.Worksheet("negatives");
 
-            _numDays = programWorksheet.Cell(1, 1).GetValue<int>();
-            _totalShifts = _numDays * SHIFTS_PER_DAY;
+            _numDays = programWorksheet.Cell(35, 5).GetValue<int>();
+            _allowB2BShifts = programWorksheet.Cell(35, 2).GetValue<bool>();
+            _balanceShiftsAutomatically = programWorksheet.Cell(36, 2).GetValue<bool>();
+            _totalShifts = programWorksheet.Cell(36, 5).GetValue<int>();
+            var totalShiftPerPerson = programWorksheet.Cell(37, 5).GetValue<int>();
+            if (totalShiftPerPerson != _totalShifts)
+            {
+                throw new Exception("'Total shifts' are not equal to 'Total shifts alocated per person'");
+            }
             _numPeople = negativesWorksheet.ColumnsUsed().Count()-1;
             var rowsCount = _numDays + 1;
+            //Setup shifts per day
+            for (int row = 2; row <= rowsCount; row++)
+            {
+                var dayNumber = row - 2;
+                var shiftsPerDay = programWorksheet.Cell(row, 2).GetValue<int>();
+                SHIFTS_PER_DAY_LIST.Add(shiftsPerDay);
+            }
+            _totalShifts = SHIFTS_PER_DAY_LIST.Sum();
+
             //Setup weekends list
             for (int row = 2; row <= rowsCount; row++)
             {
@@ -172,16 +247,33 @@ class ShiftScheduler
             }
             _weekendDays = _weekendDaysIndices.Count();
 
-            //Setup workersPerDay array
-            //for (int row = 2; row <= rowsCount; row++)
-            //{
-            //    workersPerDay.Add(programWorksheet.Cell(row, 2).GetValue<int>());
-            //}
-
             //Setup people
             for (int col = 2; col <= _numPeople+1; col++)
             {
                 _people.Add(negativesWorksheet.Cell(1, col).GetValue<string>());
+            }
+
+            //Setup juniors/seniors
+            for (int col = 2; col <= _numPeople + 1; col++)
+            {
+                var personIndice = col - 2;
+                var isJunior = negativesWorksheet.Cell(35, col).GetValue<bool>();
+                if (isJunior)
+                {
+                    _juniorIndices.Add(personIndice);
+                }
+                else
+                {
+                    _seniorIndices.Add(personIndice);
+                }
+            }
+
+
+            //Setup desired Shift Counts
+            for (int col = 2; col <= _numPeople + 1; col++)
+            {
+                var shiftCount = negativesWorksheet.Cell(36, col).GetValue<int>();
+                _desiredShiftCounts.Add(shiftCount);
             }
 
             //Setup negatives for each person
@@ -198,26 +290,6 @@ class ShiftScheduler
                 }
                 _unavailableDays.Add(col - 2, negativeDaysList);
             }
-
-            //weekendCount = people.ToDictionary(person => person, person => 0);
         }
     }
-
-    //var unavailableDays = new Dictionary<int, List<int>>
-    //{
-    //    { 0, new List<int> {  } },  // ΧΡΙΣΤΟΔΟΥΛΟΥ
-    //    { 1, new List<int> {  } },  // ΦΙΛΙΠΠΟΥΣΗ
-    //    { 2, new List<int> { } },  // ΜΠΙΝΙΣΚΟΥ
-    //    { 3, new List<int> { 2 } },  // ΜΠΟΤΟΥ
-    //    { 4, new List<int> {  } },  // ΣΟΥΛΙΜΑ
-    //    { 5, new List<int> {  } },  // ΜΠΑΚΟΠΟΥΛΟΣ
-    //    { 6, new List<int> { } },  // ΚΑΡΑΜΟΛΕΓΚΟΥ
-    //    { 7, new List<int> { } },  // ΤΣΟΥΜΑ
-    //    { 8, new List<int> {  } },  // ΜΟΝΟΠΑΤΗΣ
-    //    { 9, new List<int> { } },  // ΠΡΟΔΡΟΜΑΚΗΣ
-    //    { 10, new List<int> {  } },  // ΑΥΓΕΡΙΝΟΥ
-    //    { 11, new List<int> { 22, 23 } },  // ΜΠΡΑΙΜΑΚΗΣ
-    //    { 12, new List<int> { } },  // ΠΑΠΑΚΩΝΣΤΑΝΤΙΝΟΥ
-    //    { 13, new List<int> {  } }  // ΠΑΝΑΓΟΥΛΑ
-    //};
 }
