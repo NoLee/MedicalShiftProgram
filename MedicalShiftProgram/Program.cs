@@ -1,5 +1,4 @@
 ﻿using ClosedXML.Excel;
-using DocumentFormat.OpenXml.Spreadsheet;
 using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
@@ -8,7 +7,8 @@ using System.Linq;
 class ShiftScheduler
 {
     // Define constants
-    static List<int> SHIFTS_PER_DAY_LIST = new List<int> { };
+    static string WORKBOOK = "C:\\Users\\NoLee\\source\\repos\\MedicalShiftProgram\\nosokomeio.xlsx";
+    static List<int> shiftsPerDayList = new List<int> { };
     static int _weekendDays;
     static int _numPeople;
     static int _numDays;
@@ -55,7 +55,7 @@ class ShiftScheduler
             {
                 dailyWorkers.Add(shifts[i, j]);
             }
-            model.Add(LinearExpr.Sum(dailyWorkers) == SHIFTS_PER_DAY_LIST[j]); // Adjust based on the number of shifts that day
+            model.Add(LinearExpr.Sum(dailyWorkers) == shiftsPerDayList[j]); // Adjust based on the number of shifts that day
         }
 
         // Constraint 2: No one should work two consecutive days
@@ -94,7 +94,7 @@ class ShiftScheduler
                 weekendWorkload[i].Add(shifts[i, day]);
             }
         }
-        var weekendShifts = SHIFTS_PER_DAY_LIST.Where((_, i) => _weekendDaysIndices.Contains(i)).Sum();
+        var weekendShifts = shiftsPerDayList.Where((_, i) => _weekendDaysIndices.Contains(i)).Sum();
         int minWeekendShifts = weekendShifts / _numPeople;
         int maxWeekendShifts = minWeekendShifts + 1;
 
@@ -158,58 +158,14 @@ class ShiftScheduler
             }
         }
 
-        // Solve the model
-        CpSolver solver = new CpSolver();
-        var status = solver.Solve(model);
-        var weekendCount = new List<int>();
-        var totalCount = new List<int>();
-        for (var i = 0; i <= _people.Count(); i++)
-        {
-            weekendCount.Add(0);
-            totalCount.Add(0);
-        }
         // Check results
-        if (status == CpSolverStatus.Feasible || status == CpSolverStatus.Optimal)
-        {
-            for (int j = 0; j < _numDays; j++)
-            {
-                var x = _weekendDaysIndices.Contains(j) ? "(weekend)" : "";
-                Console.Write($"Nov {j + 1}{x}: ");
-                for (int i = 0; i < _numPeople; i++)
-                {
-                    if (solver.BooleanValue(shifts[i, j]))
-                    {
-                        if (_weekendDaysIndices.Contains(j))
-                        {
-                            weekendCount[i]++;
-                        }
-                        totalCount[i]++;
-                        Console.Write($"{_people[i]} ");
-                    }
-                }
-                Console.WriteLine();
-            }
-            Console.WriteLine();
-            for (var i=0; i<_people.Count();i++)
-            {
-                Console.WriteLine($"Weekend count for {_people[i]}: {weekendCount[i]}");
-            }
-            Console.WriteLine();
-            for (var i = 0; i < _people.Count(); i++)
-            {
-                Console.WriteLine($"Total count for {_people[i]}: {totalCount[i]}");
-            }
-        }
-        else
-        {
-            Console.WriteLine("No feasible solution found.");
-        }
+        FinalizeSolution(model, shifts);
     }
 
     static void Initialize()
     {
         // Open the Excel workbook
-        using (var workbook = new XLWorkbook("C:\\Users\\NoLee\\source\\repos\\MedicalShiftProgram\\nosokomeio.xlsx"))
+        using (var workbook = new XLWorkbook(WORKBOOK))
         {
             // Access a specific worksheet by name
             var programWorksheet = workbook.Worksheet("program");
@@ -231,9 +187,9 @@ class ShiftScheduler
             {
                 var dayNumber = row - 2;
                 var shiftsPerDay = programWorksheet.Cell(row, 2).GetValue<int>();
-                SHIFTS_PER_DAY_LIST.Add(shiftsPerDay);
+                shiftsPerDayList.Add(shiftsPerDay);
             }
-            _totalShifts = SHIFTS_PER_DAY_LIST.Sum();
+            _totalShifts = shiftsPerDayList.Sum();
 
             //Setup weekends list
             for (int row = 2; row <= rowsCount; row++)
@@ -289,6 +245,90 @@ class ShiftScheduler
                     }
                 }
                 _unavailableDays.Add(col - 2, negativeDaysList);
+            }
+        }
+    }
+
+    static void FinalizeSolution(CpModel model, BoolVar[,] shifts)
+    {
+        // Solve the model
+        CpSolver solver = new CpSolver();
+        var status = solver.Solve(model);
+        var weekendCount = new List<int>();
+        var totalCount = new List<int>();
+        for (var i = 0; i <= _people.Count(); i++)
+        {
+            weekendCount.Add(0);
+            totalCount.Add(0);
+        }
+
+        using (var workbook = new XLWorkbook(WORKBOOK))
+        {
+            // Access a specific worksheet by name
+            var worksheet = workbook.Worksheet("solution");
+
+            if (status == CpSolverStatus.Feasible || status == CpSolverStatus.Optimal)
+            {
+                for (int j = 2; j < 33; j++)
+                {
+                    for (int i = 2; i < _numPeople+2; i++)
+                    {
+                        worksheet.Cell(i, j).Value = ""; //Clear previous value
+                    }
+                }
+
+                for (int j = 0; j < _numDays; j++)
+                {
+                    var col = j + 2;
+                    var weekendText = _weekendDaysIndices.Contains(j) ? "(weekend)" : "";
+                    Console.Write($"Day {j + 1}{weekendText}: ");
+                    for (int i = 0; i < _numPeople; i++)
+                    {
+                        var row = i + 2;
+                        var hasShift = solver.BooleanValue(shifts[i, j]);
+                        var hasDayOff = _unavailableDays[i].Contains(j);
+                        if (hasShift && hasDayOff)
+                        {
+                            throw new Exception($"Shift schduled on day off for {_people[i]} on day {j + 1}");
+                        } 
+                        else if (hasShift)
+                        {
+                            worksheet.Cell(row, col).Value = 1;
+                            if (_weekendDaysIndices.Contains(j))
+                            {
+                                weekendCount[i]++;
+                            }
+                            totalCount[i]++;
+                            Console.Write($"{_people[i]} ");
+                        }
+                        else if (hasDayOff)
+                        {
+                            worksheet.Cell(row, col).Value = "X";
+                        }
+                    }
+                    Console.WriteLine();
+                }
+                Console.WriteLine();
+                var totalCol = 34;
+                var totalWeekendCol = 35;
+                worksheet.Cell(1, totalCol).Value = "Total";
+                worksheet.Cell(1, totalWeekendCol).Value = "Total Weekends";
+                for (var i = 0; i < _numPeople; i++)
+                {
+                    worksheet.Cell(i + 2, totalWeekendCol).Value = weekendCount[i];
+                    Console.WriteLine($"Weekend count for {_people[i]}: {weekendCount[i]}");
+                }
+                Console.WriteLine();
+                for (var i = 0; i < _numPeople; i++)
+                {
+                    worksheet.Cell(i + 2, totalCol).Value = totalCount[i];
+                    Console.WriteLine($"Total count for {_people[i]}: {totalCount[i]}");
+                }
+                workbook.Save();
+            }
+            else
+            {
+                Console.WriteLine("No feasible solution found.");
             }
         }
     }
