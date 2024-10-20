@@ -1,4 +1,4 @@
-﻿using ClosedXML.Excel;
+using ClosedXML.Excel;
 using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
@@ -25,6 +25,7 @@ class ShiftScheduler
 
     static void Main()
     {
+        Console.OutputEncoding = System.Text.Encoding.Unicode;
         try
         {
             Initialize();
