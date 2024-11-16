@@ -1,13 +1,17 @@
 using ClosedXML.Excel;
+using DocumentFormat.OpenXml.Bibliography;
+using DocumentFormat.OpenXml.Spreadsheet;
 using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 
 class ShiftScheduler
 {
     // Define constants
     static string WORKBOOK = "C:\\Users\\NoLee\\source\\repos\\MedicalShiftProgram\\nosokomeio.xlsx";
+    static List<string> DAY_NAMES = new List<string> { "Δ","Τ","Τ","Π","Π","Σ","Κ" };
     static List<int> shiftsPerDayList = new List<int> { };
     static int _weekendDays;
     static int _numPeople;
@@ -15,8 +19,10 @@ class ShiftScheduler
     static int _totalShifts;
     static bool _allowB2BShifts;
     static bool _balanceShiftsAutomatically;
+    static string _firstDayName;
 
     static List<int> _weekendDaysIndices = new List<int> { };
+    static List<int> _isGeneralDaysIndices = new List<int> { };
     static List<string> _people = new List<string> { };
     static List<int> _juniorIndices = new List<int> { };
     static List<int> _seniorIndices = new List<int> { };
@@ -33,6 +39,7 @@ class ShiftScheduler
         catch (Exception e) 
         {
             Console.WriteLine($"ERROR: {e.Message.ToString()}");
+            Console.WriteLine($"Stacktrace: {e.StackTrace.ToString()}");
             return;
         }
 
@@ -64,16 +71,31 @@ class ShiftScheduler
         {
             for (int j = 0; j < _numDays - 2; j++)
             {
-                // If person `i` works on day `j`, then they must not work on `j+1` or `j+2`
+                // If person `i` works on day `j`, then they must not work on `j+1`
                 model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 1].Not() });
-                if (_allowB2BShifts == false)
-                {
-                    model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 2].Not() });
-                }
             }
             //Edge case for last day
             model.AddBoolOr(new ILiteral[] { shifts[i, _numDays -1].Not(), shifts[i, _numDays - 2].Not() });
         }
+        // Constraint 2b: Minimize of j+2 working days for each person
+        BoolVar[,] violations = new BoolVar[_numPeople, _numDays - 2]; // Only for days where j+2 is valid
+        for (int i = 0; i < _numPeople; i++)
+        {
+            for (int j = 0; j < _numDays - 2; j++) // Ensure j+2 is within range
+            {
+                violations[i, j] = model.NewBoolVar($"violation_{i}_{j}");
+
+                // Add the logic for a violation
+                // violation[i, j] = shifts[i, j] AND shifts[i, j+2]
+                model.AddBoolAnd(new ILiteral[] { shifts[i, j], shifts[i, j + 2] }).OnlyEnforceIf(violations[i, j]);
+                model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 2].Not() }).OnlyEnforceIf(violations[i, j].Not());
+            }
+        }
+        // Define the objective function
+        IntVar totalViolations = model.NewIntVar(0, _numPeople * (_numDays - 2), "total_violations");
+        model.Add(totalViolations == LinearExpr.Sum(from i in Enumerable.Range(0, _numPeople)
+                                                    from j in Enumerable.Range(0, _numDays - 2)
+                                                    select violations[i, j]));
 
         // Constraint 3: Respect each person's unavailable days
         foreach (var person in _unavailableDays.Keys)
@@ -159,6 +181,37 @@ class ShiftScheduler
             }
         }
 
+        // Constraint 7: Max 1 JUNIOR per day
+        for (int j = 0; j < _numDays; j++)
+        {
+            // Collect all juniors working on day j
+            List<ILiteral> juniorShiftsOnDay = new List<ILiteral>();
+            foreach (int junior in _juniorIndices)
+            {
+                juniorShiftsOnDay.Add(shifts[junior, j]);
+            }
+
+            // Ensure that at most one junior works per day
+            model.Add(LinearExpr.Sum(juniorShiftsOnDay) <= 1);
+        }
+
+        // Constraint 8: Create auxiliary variables for juniors working on general days
+        List<BoolVar> juniorOnGeneralDay = new List<BoolVar>();
+
+        foreach (int day in _isGeneralDaysIndices)
+        {
+            foreach (int junior in _juniorIndices)
+            {
+                // Track if the junior is assigned on a general day
+                juniorOnGeneralDay.Add(shifts[junior, day]);
+            }
+        }
+
+        // Minimize the total violations for j+2 day
+        model.Minimize(totalViolations);
+        // Maximize junior presence on general days
+        model.Maximize(LinearExpr.Sum(juniorOnGeneralDay));
+
         // Check results
         FinalizeSolution(model, shifts);
     }
@@ -203,6 +256,19 @@ class ShiftScheduler
                 }
             }
             _weekendDays = _weekendDaysIndices.Count();
+
+            //Setup isGeneral list
+            for (int row = 2; row <= rowsCount; row++)
+            {
+                var dayNumber = row - 2;
+                var isGeneral = programWorksheet.Cell(row, 4).GetValue<int>();
+                if (isGeneral == 1)
+                {
+                    _isGeneralDaysIndices.Add(dayNumber);
+                }
+            }
+
+            _firstDayName = programWorksheet.Cell(2, 5).GetValue<string>();
 
             //Setup people
             for (int col = 2; col <= _numPeople+1; col++)
@@ -275,14 +341,25 @@ class ShiftScheduler
                     for (int i = 2; i < _numPeople+2; i++)
                     {
                         worksheet.Cell(i, j).Value = ""; //Clear previous value
+                        worksheet.Cell(i, j).Style.Fill.BackgroundColor = XLColor.NoColor; //clear previous color
                     }
                 }
-
+                var firstDayIndice = FindFirstDayIndice(_firstDayName);
                 for (int j = 0; j < _numDays; j++)
                 {
                     var col = j + 2;
                     var weekendText = _weekendDaysIndices.Contains(j) ? "(weekend)" : "";
                     Console.Write($"Day {j + 1}{weekendText}: ");
+
+                    var currentDayIndice = (j + firstDayIndice) % (DAY_NAMES.Count);
+                    //Add label for each day
+                    worksheet.Cell(1, col).Value = DAY_NAMES[currentDayIndice];
+                    //Mark day as when isGeneral
+                    if (_isGeneralDaysIndices.Contains(j))
+                    {
+                        worksheet.Cell(1, col).Style.Fill.BackgroundColor = XLColor.Yellow;
+                    }
+                    //Mark days for each person
                     for (int i = 0; i < _numPeople; i++)
                     {
                         var row = i + 2;
@@ -332,5 +409,26 @@ class ShiftScheduler
                 Console.WriteLine("No feasible solution found.");
             }
         }
+    }
+
+    private static int FindFirstDayIndice(string dayName)
+    {
+        // Define an array with the days of the week starting from Monday
+        string[] daysOfWeek = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
+
+        // Convert the day to lowercase for case-insensitive comparison
+        dayName = dayName.ToLower();
+
+        // Loop through the array to find the index of the given day
+        for (int i = 0; i < daysOfWeek.Length; i++)
+        {
+            if (daysOfWeek[i].ToLower() == dayName)
+            {
+                return i; // Return the index
+            }
+        }
+
+        // Return -1 if the day is not found
+        return -1;
     }
 }
