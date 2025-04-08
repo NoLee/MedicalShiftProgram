@@ -1,6 +1,7 @@
 using ClosedXML.Excel;
 using DocumentFormat.OpenXml.Bibliography;
 using DocumentFormat.OpenXml.Spreadsheet;
+using Google.OrTools.ConstraintSolver;
 using Google.OrTools.Sat;
 using System;
 using System.Collections.Generic;
@@ -85,14 +86,14 @@ class ShiftScheduler
             {
                 violations[i, j] = model.NewBoolVar($"violation_{i}_{j}");
 
-                // Add the logic for a violation
-                // violation[i, j] = shifts[i, j] AND shifts[i, j+2]
-                model.AddBoolAnd(new ILiteral[] { shifts[i, j], shifts[i, j + 2] }).OnlyEnforceIf(violations[i, j]);
-                model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 2].Not() }).OnlyEnforceIf(violations[i, j].Not());
+                // Enforce that violations[i, j] is true if and only if both shifts[i, j] and shifts[i, j+2] are true
+                model.Add(shifts[i, j] + shifts[i, j + 2] <= 1).OnlyEnforceIf(violations[i, j].Not()); // No violation
+                model.Add(shifts[i, j] + shifts[i, j + 2] == 2).OnlyEnforceIf(violations[i, j]);       // Violation
             }
         }
+
         // Define the objective function
-        IntVar totalViolations = model.NewIntVar(0, _numPeople * (_numDays - 2), "total_violations");
+        Google.OrTools.Sat.IntVar totalViolations = model.NewIntVar(0, _numPeople * (_numDays - 2), "total_violations");
         model.Add(totalViolations == LinearExpr.Sum(from i in Enumerable.Range(0, _numPeople)
                                                     from j in Enumerable.Range(0, _numDays - 2)
                                                     select violations[i, j]));
@@ -108,23 +109,23 @@ class ShiftScheduler
 
         // Constraint 4: Balance weekends equally among people
         //TODO this should change accordingly
-        var weekendWorkload = new List<ILiteral>[_numPeople];
-        for (int i = 0; i < _numPeople; i++)
-        {
-            weekendWorkload[i] = new List<ILiteral>();
-            foreach (var day in _weekendDaysIndices)
-            {
-                weekendWorkload[i].Add(shifts[i, day]);
-            }
-        }
-        var weekendShifts = shiftsPerDayList.Where((_, i) => _weekendDaysIndices.Contains(i)).Sum();
-        int minWeekendShifts = weekendShifts / _numPeople;
-        int maxWeekendShifts = minWeekendShifts + 1;
+        //var weekendWorkload = new List<ILiteral>[_numPeople];
+        //for (int i = 0; i < _numPeople; i++)
+        //{
+        //    weekendWorkload[i] = new List<ILiteral>();
+        //    foreach (var day in _weekendDaysIndices)
+        //    {
+        //        weekendWorkload[i].Add(shifts[i, day]);
+        //    }
+        //}
+        //var weekendShifts = shiftsPerDayList.Where((_, i) => _weekendDaysIndices.Contains(i)).Sum();
+        //int minWeekendShifts = weekendShifts / _numPeople;
+        //int maxWeekendShifts = minWeekendShifts + 1;
 
-        for (int i = 0; i < _numPeople; i++)
-        {
-            model.AddLinearConstraint(LinearExpr.Sum(weekendWorkload[i]), minWeekendShifts, maxWeekendShifts);
-        }
+        //for (int i = 0; i < _numPeople; i++)
+        //{
+        //    model.AddLinearConstraint(LinearExpr.Sum(weekendWorkload[i]), minWeekendShifts, maxWeekendShifts);
+        //}
 
         if (_balanceShiftsAutomatically)
         {
@@ -207,10 +208,60 @@ class ShiftScheduler
             }
         }
 
-        // Minimize the total violations for j+2 day
+        //// Minimize the total violations for j+2 day
+        //model.Minimize(totalViolations);
+        //// Maximize junior presence on general days
+        //model.Maximize(LinearExpr.Sum(juniorOnGeneralDay));
+
+        // Step 1: Solve for minimum violations
         model.Minimize(totalViolations);
-        // Maximize junior presence on general days
+        CpSolver solver = new CpSolver();
+        CpSolverStatus status = solver.Solve(model);
+        int minViolations = (int)solver.ObjectiveValue;  // Store the best possible violations count
+
+        // Step 2: Re-run with a constraint on totalViolations and maximize junior presence
+        //model.Add(totalViolations == minViolations);  // Ensure we maintain optimal violations
         model.Maximize(LinearExpr.Sum(juniorOnGeneralDay));
+        solver.Solve(model);
+
+
+
+
+        //SolutionCollector solutionCollector = new SolutionCollector(shifts, _numPeople, _numDays);
+
+        //// Set solver parameters (optional)
+        //solver.StringParameters = "num_search_workers:8"; // Use multiple threads for faster search
+        //solver.StringParameters = "max_time_in_seconds:60"; // Stop after 60 seconds
+
+        //// Solve the model and collect solutions
+        //CpSolverStatus status2 = solver.Solve(model, solutionCollector);
+
+        //// Check results
+        //if (status2 == CpSolverStatus.Feasible || status2 == CpSolverStatus.Optimal)
+        //{
+        //    List<int[,]> solutions = solutionCollector.GetSolutions();
+        //    Console.WriteLine($"Found {solutions.Count} solutions.");
+
+        //    // Display or save the solutions
+        //    for (int s = 0; s < solutions.Count; s++)
+        //    {
+        //        Console.WriteLine($"Solution {s + 1}:");
+        //        for (int i = 0; i < _numPeople; i++)
+        //        {
+        //            for (int j = 0; j < _numDays; j++)
+        //            {
+        //                Console.Write(solutions[s][i, j] + " ");
+        //            }
+        //            Console.WriteLine();
+        //        }
+        //        Console.WriteLine();
+        //    }
+        //}
+        //else
+        //{
+        //    Console.WriteLine("No feasible solution found.");
+        //}
+
 
         // Check results
         FinalizeSolution(model, shifts);
