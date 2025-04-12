@@ -86,9 +86,10 @@ class ShiftScheduler
             {
                 violations[i, j] = model.NewBoolVar($"violation_{i}_{j}");
 
-                // Enforce that violations[i, j] is true if and only if both shifts[i, j] and shifts[i, j+2] are true
-                model.Add(shifts[i, j] + shifts[i, j + 2] <= 1).OnlyEnforceIf(violations[i, j].Not()); // No violation
-                model.Add(shifts[i, j] + shifts[i, j + 2] == 2).OnlyEnforceIf(violations[i, j]);       // Violation
+                // Add the logic for a violation
+                // violation[i, j] = shifts[i, j] AND shifts[i, j+2]
+                model.AddBoolAnd(new ILiteral[] { shifts[i, j], shifts[i, j + 2] }).OnlyEnforceIf(violations[i, j]);
+                model.AddBoolOr(new ILiteral[] { shifts[i, j].Not(), shifts[i, j + 2].Not() }).OnlyEnforceIf(violations[i, j].Not());
             }
         }
 
@@ -219,48 +220,52 @@ class ShiftScheduler
         CpSolverStatus status = solver.Solve(model);
         int minViolations = (int)solver.ObjectiveValue;  // Store the best possible violations count
 
+        //TODO MPEN-NEXT: add or remove the following validation in the future
+        //----------------------------------------------------------------------------------------------------------------------------------
         // Step 2: Re-run with a constraint on totalViolations and maximize junior presence
         //model.Add(totalViolations == minViolations);  // Ensure we maintain optimal violations
-        model.Maximize(LinearExpr.Sum(juniorOnGeneralDay));
-        solver.Solve(model);
+        //model.Maximize(LinearExpr.Sum(juniorOnGeneralDay));
+        //solver.Solve(model);
+        //----------------------------------------------------------------------------------------------------------------------------------
 
 
 
+        SolutionCollector solutionCollector = new SolutionCollector(shifts, _numPeople, _numDays);
 
-        //SolutionCollector solutionCollector = new SolutionCollector(shifts, _numPeople, _numDays);
+        // Set solver parameters (optional)
+        solver.StringParameters = "num_search_workers:8"; // Use multiple threads for faster search
+        solver.StringParameters = "max_time_in_seconds:60"; // Stop after 60 seconds
 
-        //// Set solver parameters (optional)
-        //solver.StringParameters = "num_search_workers:8"; // Use multiple threads for faster search
-        //solver.StringParameters = "max_time_in_seconds:60"; // Stop after 60 seconds
+        // Solve the model and collect solutions
+        CpSolverStatus status2 = solver.Solve(model, solutionCollector);
 
-        //// Solve the model and collect solutions
-        //CpSolverStatus status2 = solver.Solve(model, solutionCollector);
+        // Check results
+        if (status2 == CpSolverStatus.Feasible || status2 == CpSolverStatus.Optimal)
+        {
+            List<int[,]> solutions = solutionCollector.GetSolutions();
+            Console.WriteLine($"Found {solutions.Count} solutions.");
 
-        //// Check results
-        //if (status2 == CpSolverStatus.Feasible || status2 == CpSolverStatus.Optimal)
-        //{
-        //    List<int[,]> solutions = solutionCollector.GetSolutions();
-        //    Console.WriteLine($"Found {solutions.Count} solutions.");
-
-        //    // Display or save the solutions
-        //    for (int s = 0; s < solutions.Count; s++)
-        //    {
-        //        Console.WriteLine($"Solution {s + 1}:");
-        //        for (int i = 0; i < _numPeople; i++)
-        //        {
-        //            for (int j = 0; j < _numDays; j++)
-        //            {
-        //                Console.Write(solutions[s][i, j] + " ");
-        //            }
-        //            Console.WriteLine();
-        //        }
-        //        Console.WriteLine();
-        //    }
-        //}
-        //else
-        //{
-        //    Console.WriteLine("No feasible solution found.");
-        //}
+            // Display or save the solutions
+            for (int s = 0; s < solutions.Count; s++)
+            {
+                Console.WriteLine($"Solution {s + 1}:");
+                for (int i = 0; i < _numPeople; i++)
+                {
+                    for (int j = 0; j < _numDays; j++)
+                    {
+                        Console.Write(solutions[s][i, j] + " ");
+                    }
+                    Console.WriteLine();
+                }
+                var x = solutions[s];
+                FinalizeSolutionNew(model, x, "solution_new_"+s);
+                Console.WriteLine();
+            }
+        }
+        else
+        {
+            Console.WriteLine("No feasible solution found.");
+        }
 
 
         // Check results
@@ -461,6 +466,104 @@ class ShiftScheduler
             }
         }
     }
+
+
+    static void FinalizeSolutionNew(CpModel model, int[,] solution, string sheet)
+    {
+        // Solve the model
+        CpSolver solver = new CpSolver();
+        var status = solver.Solve(model);
+        var weekendCount = new List<int>();
+        var totalCount = new List<int>();
+        for (var i = 0; i <= _people.Count(); i++)
+        {
+            weekendCount.Add(0);
+            totalCount.Add(0);
+        }
+
+        using (var workbook = new XLWorkbook(WORKBOOK))
+        {
+            // Access a specific worksheet by name
+            var worksheet = workbook.Worksheet(sheet);
+
+            if (status == CpSolverStatus.Feasible || status == CpSolverStatus.Optimal)
+            {
+                for (int j = 2; j < 33; j++)
+                {
+                    for (int i = 2; i < _numPeople + 2; i++)
+                    {
+                        worksheet.Cell(i, j).Value = ""; //Clear previous value
+                        worksheet.Cell(i, j).Style.Fill.BackgroundColor = XLColor.NoColor; //clear previous color
+                    }
+                }
+                var firstDayIndice = FindFirstDayIndice(_firstDayName);
+                for (int j = 0; j < _numDays; j++)
+                {
+                    var col = j + 2;
+                    var weekendText = _weekendDaysIndices.Contains(j) ? "(weekend)" : "";
+                    Console.Write($"Day {j + 1}{weekendText}: ");
+
+                    var currentDayIndice = (j + firstDayIndice) % (DAY_NAMES.Count);
+                    //Add label for each day
+                    worksheet.Cell(1, col).Value = DAY_NAMES[currentDayIndice];
+                    //Mark day as when isGeneral
+                    if (_isGeneralDaysIndices.Contains(j))
+                    {
+                        worksheet.Cell(1, col).Style.Fill.BackgroundColor = XLColor.Yellow;
+                    }
+                    //Mark days for each person
+                    for (int i = 0; i < _numPeople; i++)
+                    {
+                        var row = i + 2;
+                        var hasShift = solution[i, j] == 1;
+                        var hasDayOff = _unavailableDays[i].Contains(j);
+                        if (hasShift && hasDayOff)
+                        {
+                            throw new Exception($"Shift schduled on day off for {_people[i]} on day {j + 1}");
+                        }
+                        else if (hasShift)
+                        {
+                            worksheet.Cell(row, col).Value = 1;
+                            if (_weekendDaysIndices.Contains(j))
+                            {
+                                weekendCount[i]++;
+                            }
+                            totalCount[i]++;
+                            Console.Write($"{_people[i]} ");
+                        }
+                        else if (hasDayOff)
+                        {
+                            worksheet.Cell(row, col).Value = "X";
+                        }
+                    }
+                    Console.WriteLine();
+                }
+                Console.WriteLine();
+                var totalCol = 34;
+                var totalWeekendCol = 35;
+                worksheet.Cell(1, totalCol).Value = "Total";
+                worksheet.Cell(1, totalWeekendCol).Value = "Total Weekends";
+                for (var i = 0; i < _numPeople; i++)
+                {
+                    worksheet.Cell(i + 2, totalWeekendCol).Value = weekendCount[i];
+                    Console.WriteLine($"Weekend count for {_people[i]}: {weekendCount[i]}");
+                }
+                Console.WriteLine();
+                for (var i = 0; i < _numPeople; i++)
+                {
+                    worksheet.Cell(i + 2, totalCol).Value = totalCount[i];
+                    Console.WriteLine($"Total count for {_people[i]}: {totalCount[i]}");
+                }
+                workbook.Save();
+            }
+            else
+            {
+                Console.WriteLine("No feasible solution found.");
+            }
+        }
+    }
+
+
 
     private static int FindFirstDayIndice(string dayName)
     {
